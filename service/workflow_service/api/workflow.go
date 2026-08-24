@@ -133,28 +133,45 @@ func (service *WorkflowService) UpdateWorkflow(c *fiber.Ctx) error {
 				if err != nil {
 					return err
 				}
-				if currentWorkflow.Active == params.Active {
+				webhooksMaterialized, err := core.WorkflowWebhooksAreMaterialized(
+					c.UserContext(), currentWorkflow, params.Active)
+				if err != nil {
+					return err
+				}
+				scheduleMaterialized, err := temporal.ScheduleTriggerIsMaterialized(
+					c.UserContext(), currentWorkflow, params.Active)
+				if err != nil {
+					return err
+				}
+				activeStateChanged := currentWorkflow.Active != params.Active
+				if !activeStateChanged && webhooksMaterialized && scheduleMaterialized {
 					workflowEntity = currentWorkflow
 					return nil
 				}
 
 				workflowEntityForTemporal := *currentWorkflow
 				workflowEntityForTemporal.Active = params.Active
-				if params.Active {
-					// Set up temporal workflow for active schedule trigger.
-					err = temporal.SetupTemporalWorkflow_ScheduleTrigger(
-						c.UserContext(), &workflowEntityForTemporal)
-				} else {
-					err = temporal.TerminateTemporalWorkflow_ScheduleTrigger(
-						c.UserContext(), &workflowEntityForTemporal)
-				}
-				if err != nil {
-					return err
+				temporalLifecycleChanged := false
+				if !scheduleMaterialized {
+					if params.Active {
+						// Set up temporal workflow for active schedule trigger.
+						err = temporal.SetupTemporalWorkflow_ScheduleTrigger(
+							c.UserContext(), &workflowEntityForTemporal)
+					} else {
+						err = temporal.TerminateTemporalWorkflow_ScheduleTrigger(
+							c.UserContext(), &workflowEntityForTemporal)
+					}
+					if err != nil {
+						return err
+					}
+					temporalLifecycleChanged = true
 				}
 
-				_, err = core.UpdateWorkflowActiveWithWebhooks(
-					c.UserContext(), currentWorkflow, params.Active)
-				if err != nil {
+				if activeStateChanged || !webhooksMaterialized {
+					_, err = core.UpdateWorkflowActiveWithWebhooks(
+						c.UserContext(), currentWorkflow, params.Active)
+				}
+				if err != nil && temporalLifecycleChanged {
 					var compensationErr error
 					if params.Active {
 						compensationErr = temporal.TerminateTemporalWorkflow_ScheduleTrigger(
@@ -166,6 +183,9 @@ func (service *WorkflowService) UpdateWorkflow(c *fiber.Ctx) error {
 					if compensationErr != nil {
 						err = fmt.Errorf("%w; temporal compensation failed: %v", err, compensationErr)
 					}
+					return err
+				}
+				if err != nil {
 					return err
 				}
 

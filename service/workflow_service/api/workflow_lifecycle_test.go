@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	temporalEnums "go.temporal.io/api/enums/v1"
+	"go.temporal.io/api/serviceerror"
 
 	"github.com/sugerio/workflow-service-trial/service/workflow_service/api"
 	workflowTemporal "github.com/sugerio/workflow-service-trial/service/workflow_service/temporal"
@@ -69,6 +70,35 @@ func TestRepeatedActivationIsIdempotentForWebhookOnlyWorkflow(t *testing.T) {
 		testFiberLambda, http.MethodPost, current.ID, nodeID, webhookID, false, `{"data":"test"}`)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, response.StatusCode)
+}
+
+func TestPreActiveWorkflowActivationMaterializesLifecycle(t *testing.T) {
+	organization := structs.CreateOrganization_Testing(rdsDbQueries, sid, "")
+	workflow, err := api.CreateWorkflow_Testing(
+		testFiberLambda, organization.ID, "test_files/workflow_lifecycle_form_schedule_active.json")
+	require.NoError(t, err)
+	require.NotNil(t, workflow)
+	require.True(t, workflow.Active)
+
+	t.Cleanup(func() {
+		_ = api.DeactivateWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID)
+		_ = api.DeleteWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID)
+	})
+
+	formNode := workflow.Nodes[0]
+	webhooks, err := api.GetWebhookEntities(workflow.ID, formNode.WebhookId)
+	require.NoError(t, err)
+	require.Empty(t, webhooks)
+	_, err = temporalClient.DescribeWorkflowExecution(
+		context.Background(),
+		workflowTemporal.GetTemporalWorkflowId_ScheduleTrigger(workflow.SugerOrgId, workflow.ID),
+		"",
+	)
+	var notFound *serviceerror.NotFound
+	require.ErrorAs(t, err, &notFound)
+
+	require.NoError(t, api.ActivateWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID))
+	assertActiveFormScheduleLifecycle(t, workflow)
 }
 
 func TestRepeatedDeactivationIsIdempotent(t *testing.T) {

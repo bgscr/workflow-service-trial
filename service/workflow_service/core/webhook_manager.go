@@ -52,16 +52,20 @@ func registerWebhook(
 	if len(webhooks) == 0 {
 		return nil
 	}
-	for _, webhook := range webhooks {
+	missingWebhooks, err := missingWebhookEntities(ctx, queries, webhooks)
+	if err != nil {
+		return err
+	}
+	for _, webhook := range missingWebhooks {
 		// Create record in webhook_entity
-		_, err := saveWebhookEntity(ctx, queries, &webhook)
+		_, err = saveWebhookEntity(ctx, queries, &webhook)
 		if err != nil {
 			return fmt.Errorf(
 				"webhook %s workflowId %s save failed: %w",
 				webhook.WebhookId, webhook.WorkflowId, err)
 		}
 	}
-	for _, webhook := range webhooks {
+	for _, webhook := range missingWebhooks {
 		if err := CallWebhookCreateMethod(ctx, &webhook, workflowEntity); err != nil {
 			return fmt.Errorf(
 				"webhook %s workflowId %s create hook failed: %w",
@@ -69,12 +73,64 @@ func registerWebhook(
 		}
 	}
 
-	err := updateWorkflowStaticData(ctx, queries, workflowEntity.ID, workflowEntity.StaticData)
+	err = updateWorkflowStaticData(ctx, queries, workflowEntity.ID, workflowEntity.StaticData)
 	if err != nil {
 		Errorf("Failed to update workflow static data %v", err)
 		return err
 	}
 	return nil
+}
+
+// WorkflowWebhooksAreMaterialized reports whether every production webhook declaration
+// has a corresponding persisted entity in the desired active state.
+func WorkflowWebhooksAreMaterialized(
+	ctx context.Context,
+	workflowEntity *structs.WorkflowEntity,
+	active bool,
+) (bool, error) {
+	webhooks := GetWorkflowWebhooks(workflowEntity, false)
+	missing, err := missingWebhookEntities(ctx, GetRdsDbQueries(), webhooks)
+	if err != nil {
+		return false, err
+	}
+	if active {
+		return len(missing) == 0, nil
+	}
+	return len(missing) == len(webhooks), nil
+}
+
+func missingWebhookEntities(
+	ctx context.Context,
+	queries *rdsDbLib.Queries,
+	webhooks []structs.WebhookData,
+) ([]structs.WebhookData, error) {
+	missing := make([]structs.WebhookData, 0, len(webhooks))
+	for _, webhook := range webhooks {
+		entities, err := queries.ListWebhookEntities(
+			ctx,
+			rdsDbLib.ListWebhookEntitiesParams{
+				WorkflowId: webhook.WorkflowId,
+				WebhookId:  sql.NullString{String: webhook.WebhookId, Valid: true},
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		materialized := false
+		for _, entity := range entities {
+			if entity.WebhookPath == webhook.Path &&
+				entity.Method == webhook.HttpMethod &&
+				entity.Node == webhook.Node {
+				materialized = true
+				break
+			}
+		}
+		if !materialized {
+			missing = append(missing, webhook)
+		}
+	}
+	return missing, nil
 }
 
 func updateWorkflowStaticData(
