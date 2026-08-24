@@ -17,6 +17,10 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
+type formRenderer interface {
+	RenderForm(node *structs.WorkflowNode, actionURL string) ([]byte, error)
+}
+
 func TestFormTriggerIsRegisteredWithWebhooksAndIcon(t *testing.T) {
 	const nodeName = "n8n-nodes-base.formTrigger"
 
@@ -81,7 +85,7 @@ func TestWebhookDiscoveryStillUsesParameterDerivedMethod(t *testing.T) {
 
 func TestFormTriggerRendersConfiguredEscapedHTML(t *testing.T) {
 	nodeObject := core.GetAllNodeObjects()["n8n-nodes-base.formTrigger"]
-	renderer, ok := nodeObject.(core.NodeFormRenderer)
+	renderer, ok := nodeObject.(formRenderer)
 	require.True(t, ok)
 
 	formNode := &structs.WorkflowNode{Parameters: map[string]interface{}{
@@ -209,6 +213,54 @@ func TestFormTriggerParsesURLAndMultipartFormSubmissions(t *testing.T) {
 			require.Equal(t, test.formMode, output["formMode"])
 			_, err := time.Parse(time.RFC3339, output["submittedAt"].(string))
 			require.NoError(t, err)
+		})
+	}
+}
+
+func TestFormTriggerRejectsInvalidOutputLabels(t *testing.T) {
+	tests := []struct {
+		name        string
+		labels      []string
+		expectedErr string
+	}{
+		{
+			name:        "duplicate labels",
+			labels:      []string{"Name", "Name"},
+			expectedErr: `form trigger field labels must be unique: "Name"`,
+		},
+		{
+			name:        "submittedAt is reserved",
+			labels:      []string{"submittedAt"},
+			expectedErr: `form trigger field label "submittedAt" is reserved`,
+		},
+		{
+			name:        "formMode is reserved",
+			labels:      []string{"formMode"},
+			expectedErr: `form trigger field label "formMode" is reserved`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fields := make([]interface{}, 0, len(test.labels))
+			for _, label := range test.labels {
+				fields = append(fields, map[string]interface{}{"fieldLabel": label})
+			}
+			request := &fasthttp.Request{}
+			request.Header.SetContentType("application/x-www-form-urlencoded")
+			result := core.GetAllNodeObjects()["n8n-nodes-base.formTrigger"].Execute(
+				context.Background(),
+				&structs.NodeExecuteInput{
+					Params: &structs.WorkflowNode{Parameters: map[string]interface{}{
+						"formFields": map[string]interface{}{"values": fields},
+					}},
+					AdditionalData: &structs.WorkflowExecuteAdditionalData{HttpRequest: request},
+				},
+			)
+
+			require.Equal(t, structs.WorkflowExecutionStatus_Failed, result.ExecutionStatus)
+			require.Len(t, result.Errors, 1)
+			require.Equal(t, test.expectedErr, result.Errors[0].Message)
 		})
 	}
 }

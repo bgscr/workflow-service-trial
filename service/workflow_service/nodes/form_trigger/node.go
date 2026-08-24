@@ -172,6 +172,16 @@ func parseFormConfiguration(node *structs.WorkflowNode) (*formConfiguration, err
 	if err := json.Unmarshal(data, configuration); err != nil {
 		return nil, err
 	}
+	labels := make(map[string]struct{}, len(configuration.Fields.Values))
+	for _, field := range configuration.Fields.Values {
+		if field.Label == "submittedAt" || field.Label == "formMode" {
+			return nil, fmt.Errorf("form trigger field label %q is reserved", field.Label)
+		}
+		if _, exists := labels[field.Label]; exists {
+			return nil, fmt.Errorf("form trigger field labels must be unique: %q", field.Label)
+		}
+		labels[field.Label] = struct{}{}
+	}
 	return configuration, nil
 }
 

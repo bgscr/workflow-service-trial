@@ -2,7 +2,9 @@ package core
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/sugerio/workflow-service-trial/shared/structs"
@@ -26,30 +28,42 @@ func RegisterWebhook(ctx context.Context, workflowID string, isTest bool) error 
 	if len(webhooks) == 0 {
 		return nil
 	}
+	queries, tx, err := GetRdsDbQueries().BeginTx(ctx)
+	if err != nil {
+		return err
+	}
 	for _, webhook := range webhooks {
 		// Create record in webhook_entity
-		_, err := SaveWebhookEntity(ctx, &webhook)
+		_, err := saveWebhookEntity(ctx, queries, &webhook)
 		if err != nil {
-			Errorf("webhook %s workflowId %s save failed with err %v", webhook.WebhookId, webhook.WorkflowId, err)
-			continue
+			return rollbackWebhookTransaction(tx, fmt.Errorf(
+				"webhook %s workflowId %s save failed: %w",
+				webhook.WebhookId, webhook.WorkflowId, err))
 		}
+	}
+	for _, webhook := range webhooks {
 		CallWebhookCreateMethod(ctx, &webhook, workflowEntity)
 	}
 
-	err = updateWorkflowStaticData(ctx, workflowID, workflowEntity.StaticData)
+	err = updateWorkflowStaticData(ctx, queries, workflowID, workflowEntity.StaticData)
 	if err != nil {
 		Errorf("Failed to update workflow static data %v", err)
-		return err
+		return rollbackWebhookTransaction(tx, err)
 	}
-	return nil
+	return tx.Commit()
 }
 
-func updateWorkflowStaticData(ctx context.Context, workflowId string, staticData map[string]interface{}) error {
+func updateWorkflowStaticData(
+	ctx context.Context,
+	queries *rdsDbLib.Queries,
+	workflowId string,
+	staticData map[string]interface{},
+) error {
 	staticDataJson, err := json.Marshal(staticData)
 	if err != nil {
 		return err
 	}
-	_, err = GetRdsDbQueries().UpdateWorkflowEntityStaticDataByID(
+	_, err = queries.UpdateWorkflowEntityStaticDataByID(
 		ctx,
 		rdsDbLib.UpdateWorkflowEntityStaticDataByIDParams{
 			ID: workflowId,
@@ -81,22 +95,36 @@ func UnregisterWebhook(ctx context.Context, workflowID string, isTest bool) erro
 	if len(webhooks) == 0 {
 		return nil
 	}
-	for _, webhook := range webhooks {
-		CallWebhookDeleteMethod(ctx, &webhook, workflowEntity)
-		err := DeleteWebhookEntity(ctx, &webhook)
-		if err != nil {
-			Errorf("delete webhook entity error. workflowId:%s webhookPath:%s method:%s",
-				workflowID, webhook.Path, webhook.HttpMethod)
-		}
-	}
-
-	err = updateWorkflowStaticData(ctx, workflowID, workflowEntity.StaticData)
+	queries, tx, err := GetRdsDbQueries().BeginTx(ctx)
 	if err != nil {
-		Errorf("Failed to update workflow static data %v", err)
 		return err
 	}
+	for _, webhook := range webhooks {
+		err := deleteWebhookEntity(ctx, queries, &webhook)
+		if err != nil {
+			return rollbackWebhookTransaction(tx, fmt.Errorf(
+				"delete webhook entity error for workflowId %s webhookPath %s method %s: %w",
+				workflowID, webhook.Path, webhook.HttpMethod, err))
+		}
+	}
+	for _, webhook := range webhooks {
+		CallWebhookDeleteMethod(ctx, &webhook, workflowEntity)
+	}
 
-	return nil
+	err = updateWorkflowStaticData(ctx, queries, workflowID, workflowEntity.StaticData)
+	if err != nil {
+		Errorf("Failed to update workflow static data %v", err)
+		return rollbackWebhookTransaction(tx, err)
+	}
+
+	return tx.Commit()
+}
+
+func rollbackWebhookTransaction(tx *sql.Tx, cause error) error {
+	if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+		return fmt.Errorf("%w; rollback failed: %v", cause, err)
+	}
+	return cause
 }
 
 // Register all webhooks of all active workflows. Regardless the orgId.

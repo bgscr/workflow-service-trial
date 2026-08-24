@@ -167,11 +167,19 @@ func getWebhookMethod(node *structs.WorkflowNode) string {
 // Save webhook entity to db
 func SaveWebhookEntity(
 	ctx context.Context, webhookData *structs.WebhookData) (rdsDbLib.WorkflowWebhookEntity, error) {
+	return saveWebhookEntity(ctx, GetRdsDbQueries(), webhookData)
+}
+
+func saveWebhookEntity(
+	ctx context.Context,
+	queries *rdsDbLib.Queries,
+	webhookData *structs.WebhookData,
+) (rdsDbLib.WorkflowWebhookEntity, error) {
 	if webhookData == nil {
 		return rdsDbLib.WorkflowWebhookEntity{}, errors.New("webhookData is nil")
 	}
 
-	return GetRdsDbQueries().CreateWebhookEntity(
+	return queries.CreateWebhookEntity(
 		ctx,
 		rdsDbLib.CreateWebhookEntityParams{
 			WebhookPath: webhookData.Path,
@@ -184,10 +192,18 @@ func SaveWebhookEntity(
 
 // Delete webhook entity from db.
 func DeleteWebhookEntity(ctx context.Context, webhookData *structs.WebhookData) error {
+	return deleteWebhookEntity(ctx, GetRdsDbQueries(), webhookData)
+}
+
+func deleteWebhookEntity(
+	ctx context.Context,
+	queries *rdsDbLib.Queries,
+	webhookData *structs.WebhookData,
+) error {
 	if webhookData == nil {
 		return nil
 	}
-	return GetRdsDbQueries().DeleteWebhookEntityByWorkflowId_Path_Method(
+	return queries.DeleteWebhookEntityByWorkflowId_Path_Method(
 		ctx,
 		rdsDbLib.DeleteWebhookEntityByWorkflowId_Path_MethodParams{
 			WorkflowId:  webhookData.WorkflowId,
