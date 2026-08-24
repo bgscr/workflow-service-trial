@@ -62,7 +62,11 @@ func registerWebhook(
 		}
 	}
 	for _, webhook := range webhooks {
-		CallWebhookCreateMethod(ctx, &webhook, workflowEntity)
+		if err := CallWebhookCreateMethod(ctx, &webhook, workflowEntity); err != nil {
+			return fmt.Errorf(
+				"webhook %s workflowId %s create hook failed: %w",
+				webhook.WebhookId, webhook.WorkflowId, err)
+		}
 	}
 
 	err := updateWorkflowStaticData(ctx, queries, workflowEntity.ID, workflowEntity.StaticData)
@@ -139,16 +143,15 @@ func unregisterWebhook(
 	if len(webhooks) == 0 {
 		return nil
 	}
-	for _, webhook := range webhooks {
-		err := deleteWebhookEntity(ctx, queries, &webhook)
-		if err != nil {
-			return fmt.Errorf(
-				"delete webhook entity error for workflowId %s webhookPath %s method %s: %w",
-				workflowEntity.ID, webhook.Path, webhook.HttpMethod, err)
-		}
+	if err := deleteWebhookEntities(ctx, queries, workflowEntity, webhooks); err != nil {
+		return err
 	}
 	for _, webhook := range webhooks {
-		CallWebhookDeleteMethod(ctx, &webhook, workflowEntity)
+		if err := CallWebhookDeleteMethod(ctx, &webhook, workflowEntity); err != nil {
+			return fmt.Errorf(
+				"webhook %s workflowId %s delete hook failed: %w",
+				webhook.WebhookId, webhook.WorkflowId, err)
+		}
 	}
 
 	err := updateWorkflowStaticData(ctx, queries, workflowEntity.ID, workflowEntity.StaticData)
@@ -158,6 +161,89 @@ func unregisterWebhook(
 	}
 
 	return nil
+}
+
+func deleteWebhookEntities(
+	ctx context.Context,
+	queries *rdsDbLib.Queries,
+	workflowEntity *structs.WorkflowEntity,
+	webhooks []structs.WebhookData,
+) error {
+	for _, webhook := range webhooks {
+		err := deleteWebhookEntity(ctx, queries, &webhook)
+		if err != nil {
+			return fmt.Errorf(
+				"delete webhook entity error for workflowId %s webhookPath %s method %s: %w",
+				workflowEntity.ID, webhook.Path, webhook.HttpMethod, err)
+		}
+	}
+	return nil
+}
+
+// DeleteWorkflowWithWebhooks removes all persistent workflow lifecycle state in one transaction.
+func DeleteWorkflowWithWebhooks(
+	ctx context.Context,
+	workflowEntity *structs.WorkflowEntity,
+) (*structs.WorkflowEntity, error) {
+	productionWebhooks := GetWorkflowWebhooks(workflowEntity, false)
+	testWebhooks := GetWorkflowWebhooks(workflowEntity, true)
+	allWebhooks := append(append([]structs.WebhookData{}, productionWebhooks...), testWebhooks...)
+	externallyDeleted := make([]structs.WebhookData, 0, len(allWebhooks))
+	for index := range allWebhooks {
+		webhook := &allWebhooks[index]
+		externallyDeleted = append(externallyDeleted, *webhook)
+		if err := CallWebhookDeleteMethod(ctx, webhook, workflowEntity); err != nil {
+			return nil, compensateWebhookDeletion(ctx, workflowEntity, externallyDeleted, err)
+		}
+	}
+
+	queries, tx, err := GetRdsDbQueries().BeginTx(ctx)
+	if err != nil {
+		return nil, compensateWebhookDeletion(ctx, workflowEntity, externallyDeleted, err)
+	}
+	if err = deleteWebhookEntities(ctx, queries, workflowEntity, productionWebhooks); err != nil {
+		return nil, compensateWebhookDeletion(
+			ctx, workflowEntity, externallyDeleted, rollbackWebhookTransaction(tx, err))
+	}
+	if err = deleteWebhookEntities(ctx, queries, workflowEntity, testWebhooks); err != nil {
+		return nil, compensateWebhookDeletion(
+			ctx, workflowEntity, externallyDeleted, rollbackWebhookTransaction(tx, err))
+	}
+	workflowEntityDB, err := queries.DeleteWorkflowEntity(
+		ctx,
+		rdsDbLib.DeleteWorkflowEntityParams{
+			SugerOrgId: workflowEntity.SugerOrgId,
+			ID:         workflowEntity.ID,
+		},
+	)
+	if err != nil {
+		return nil, compensateWebhookDeletion(
+			ctx, workflowEntity, externallyDeleted, rollbackWebhookTransaction(tx, err))
+	}
+	deletedWorkflow, err := structs.ToWorkflowEntity(workflowEntityDB)
+	if err != nil {
+		return nil, compensateWebhookDeletion(
+			ctx, workflowEntity, externallyDeleted, rollbackWebhookTransaction(tx, err))
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, compensateWebhookDeletion(
+			ctx, workflowEntity, externallyDeleted, rollbackWebhookTransaction(tx, err))
+	}
+	return &deletedWorkflow, nil
+}
+
+func compensateWebhookDeletion(
+	ctx context.Context,
+	workflowEntity *structs.WorkflowEntity,
+	webhooks []structs.WebhookData,
+	cause error,
+) error {
+	for index := len(webhooks) - 1; index >= 0; index-- {
+		if compensationErr := CallWebhookCreateMethod(ctx, &webhooks[index], workflowEntity); compensationErr != nil {
+			cause = fmt.Errorf("%w; webhook compensation failed: %v", cause, compensationErr)
+		}
+	}
+	return cause
 }
 
 // UpdateWorkflowActiveWithWebhooks updates the workflow active state and its online webhooks in one transaction.
@@ -195,6 +281,41 @@ func UpdateWorkflowActiveWithWebhooks(
 		return nil, rollbackWebhookTransaction(tx, err)
 	}
 	if err := tx.Commit(); err != nil {
+		return nil, rollbackWebhookTransaction(tx, err)
+	}
+	return &workflowEntityUpdated, nil
+}
+
+// UpdateWorkflowWithWebhooks atomically replaces a workflow definition and its online webhook rows.
+func UpdateWorkflowWithWebhooks(
+	ctx context.Context,
+	previousWorkflow *structs.WorkflowEntity,
+	params rdsDbLib.UpdateWorkflowEntityParams,
+) (*structs.WorkflowEntity, error) {
+	queries, tx, err := GetRdsDbQueries().BeginTx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if previousWorkflow.Active {
+		if err = unregisterWebhook(ctx, queries, previousWorkflow, false); err != nil {
+			return nil, rollbackWebhookTransaction(tx, err)
+		}
+	}
+
+	workflowEntityUpdatedDB, err := queries.UpdateWorkflowEntity(ctx, params)
+	if err != nil {
+		return nil, rollbackWebhookTransaction(tx, err)
+	}
+	workflowEntityUpdated, err := structs.ToWorkflowEntity(workflowEntityUpdatedDB)
+	if err != nil {
+		return nil, rollbackWebhookTransaction(tx, err)
+	}
+	if workflowEntityUpdated.Active {
+		if err = registerWebhook(ctx, queries, &workflowEntityUpdated, false); err != nil {
+			return nil, rollbackWebhookTransaction(tx, err)
+		}
+	}
+	if err = tx.Commit(); err != nil {
 		return nil, rollbackWebhookTransaction(tx, err)
 	}
 	return &workflowEntityUpdated, nil

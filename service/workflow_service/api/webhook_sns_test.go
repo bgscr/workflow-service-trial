@@ -1,5 +1,8 @@
 package api
 
+// Focused command:
+// go test ./service/workflow_service/api -run '^TestParseSnsSubscriptionConfirmationRecognizesJSONEnvelope$' -count=1
+
 import (
 	"testing"
 

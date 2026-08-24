@@ -97,7 +97,7 @@ func CallWebhookCreateMethod(
 	ctx context.Context,
 	webhookData *structs.WebhookData,
 	workflowEntity *structs.WorkflowEntity,
-) {
+) error {
 	allNodes := GetAllNodeObjects()
 	// Call webhook checkExists and create method
 	nodeObject := allNodes[webhookData.NodeType]
@@ -107,19 +107,24 @@ func CallWebhookCreateMethod(
 		nodeMethods = newObject
 		webhookCheckExistsFunc := nodeMethods.WebhookMethods().CheckExists
 		node := findNodeById(workflowEntity, webhookData.NodeId)
-		webhookExists, _ := webhookCheckExistsFunc(ctx, workflowEntity, node, webhookData)
+		webhookExists, err := webhookCheckExistsFunc(ctx, workflowEntity, node, webhookData)
+		if err != nil {
+			return err
+		}
 		if !webhookExists {
 			webhookCreateFunc := nodeMethods.WebhookMethods().Create
-			webhookCreateFunc(ctx, workflowEntity, node, webhookData)
+			_, err = webhookCreateFunc(ctx, workflowEntity, node, webhookData)
+			return err
 		}
 	}
+	return nil
 }
 
 func CallWebhookDeleteMethod(
 	ctx context.Context,
 	webhookData *structs.WebhookData,
 	workflowEntity *structs.WorkflowEntity,
-) {
+) error {
 	allNodes := GetAllNodeObjects()
 	// Call webhook delete method
 	nodeObject := allNodes[webhookData.NodeType]
@@ -128,8 +133,10 @@ func CallWebhookDeleteMethod(
 		nodeMethods = newObject
 		webhookDeleteFunc := nodeMethods.WebhookMethods().Delete
 		node := findNodeById(workflowEntity, webhookData.NodeId)
-		webhookDeleteFunc(ctx, workflowEntity, node, webhookData)
+		_, err := webhookDeleteFunc(ctx, workflowEntity, node, webhookData)
+		return err
 	}
+	return nil
 }
 
 func findNodeById(req *structs.WorkflowEntity, nodeId string) *structs.WorkflowNode {

@@ -1,7 +1,7 @@
 package api_test
 
 // Command to run all tests under this package
-// go test -v service/workflow_service/api/*_test.go
+// go test -v ./service/workflow_service/api
 
 import (
 	"context"
