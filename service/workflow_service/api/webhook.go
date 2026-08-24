@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 
@@ -45,14 +46,12 @@ func (service *WorkflowService) HandleWebhook(ctx *fiber.Ctx) error {
 	}
 
 	// Load webhook entity
-	webhookEntity, err := core.GetWebhookEntity(ctx.UserContext(), workflowId, webhookId, isTest)
+	_, err := core.GetWebhookEntity(ctx.UserContext(), workflowId, webhookId, isTest, method)
 	if err != nil {
+		if errors.Is(err, core.ErrWebhookMethodNotAllowed) {
+			return HandleBadRequestErrorWithTrace(ctx, err)
+		}
 		return HandleNotFoundErrorWithTrace(ctx, err)
-	}
-	// Verify the http method matches
-	if webhookEntity.Method != method {
-		return HandleBadRequestErrorWithTrace(
-			ctx, errors.New("the http method is not allowed for this webhook"))
 	}
 
 	// Load workflow entity
@@ -69,6 +68,18 @@ func (service *WorkflowService) HandleWebhook(ctx *fiber.Ctx) error {
 	if webhookNode.WebhookId != webhookId {
 		return HandleBadRequestErrorWithTrace(
 			ctx, errors.New("the webhookId is not associated with the nodeId"))
+	}
+
+	if method == http.MethodGet {
+		nodeObject := core.GetAllNodeObjects()[webhookNode.Type]
+		if renderer, ok := nodeObject.(core.NodeFormRenderer); ok {
+			page, err := renderer.RenderForm(webhookNode, ctx.OriginalURL())
+			if err != nil {
+				return HandleInternalServerErrorWithTrace(ctx, err)
+			}
+			ctx.Set(fiber.HeaderContentType, "text/html; charset=utf-8")
+			return ctx.Status(fiber.StatusOK).Send(page)
+		}
 	}
 
 	// Parse webhook node options

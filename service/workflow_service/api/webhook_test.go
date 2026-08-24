@@ -4,11 +4,16 @@ package api_test
 // go test -v service/workflow_service/api/service_test.go service/workflow_service/api/webhook_test.go
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"mime/multipart"
 	"net/http"
+	"sort"
 	"testing"
 	"time"
 
+	"github.com/PuerkitoBio/goquery"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 
@@ -233,4 +238,180 @@ func (s *WebhookTestSuite) TestHandleWebhook() {
 			"TypeError: Cannot read property 'split' of undefined or null [line 2]",
 			webhookResponseBody["message"].(string))
 	})
+}
+
+func (s *WebhookTestSuite) TestFormTriggerGET() {
+	assert := require.New(s.T())
+	organization := structs.CreateOrganization_Testing(rdsDbQueries, sid, "")
+	workflow, err := api.CreateWorkflow_Testing(
+		testFiberLambda, organization.ID, "./test_files/workflow_execution_form_trigger_single.json")
+	assert.NoError(err)
+	assert.NotNil(workflow)
+
+	err = api.ActivateWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID)
+	assert.NoError(err)
+	deleted := false
+	defer func() {
+		if !deleted {
+			_ = api.DeleteWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID)
+		}
+	}()
+
+	formNode := workflow.Nodes[0]
+	entities, err := api.GetWebhookEntities(workflow.ID, formNode.WebhookId)
+	assert.NoError(err)
+	methods := make([]string, 0, len(entities))
+	for _, entity := range entities {
+		methods = append(methods, entity.Method)
+	}
+	sort.Strings(methods)
+	assert.Equal([]string{http.MethodGet, http.MethodPost}, methods)
+
+	countBefore, err := rdsDbQueries.CountWorkflowExecutionEntitiesByWorkflowId(context.Background(), workflow.ID)
+	assert.NoError(err)
+	response, err := api.CallWebhookFullResponse_Testing(
+		testFiberLambda, http.MethodGet, workflow.ID, formNode.ID, formNode.WebhookId, false, "")
+	assert.NoError(err)
+	assert.Equal(http.StatusOK, response.StatusCode)
+	assert.Contains(response.MultiValueHeaders["Content-Type"], "text/html; charset=utf-8")
+
+	document, err := goquery.NewDocumentFromReader(bytes.NewBufferString(response.Body))
+	assert.NoError(err)
+	assert.Equal("Contact us", document.Find("title").Text())
+	assert.Equal("Contact us", document.Find("h1").Text())
+	assert.Equal(
+		"We will get back to you soon. <script>alert(\"description\")</script>",
+		document.Find("p").First().Text(),
+	)
+	assert.Zero(document.Find("script").Length())
+	form := document.Find("form")
+	assert.Equal("post", form.AttrOr("method", ""))
+	assert.Contains(form.AttrOr("action", ""), "webhookId=form-trigger-webhook")
+	assert.Contains(form.AttrOr("action", ""), "isTest=false")
+	assert.Equal("text", document.Find(`input[name="field-0"]`).AttrOr("type", ""))
+	assert.Equal("email", document.Find(`input[name="field-1"]`).AttrOr("type", ""))
+	assert.Equal(2, document.Find(`select[name="field-2"] option`).Length())
+
+	countAfter, err := rdsDbQueries.CountWorkflowExecutionEntitiesByWorkflowId(context.Background(), workflow.ID)
+	assert.NoError(err)
+	assert.Equal(countBefore, countAfter)
+
+	response, err = api.CallWebhookFullResponse_Testing(
+		testFiberLambda, http.MethodPut, workflow.ID, formNode.ID, formNode.WebhookId, false, "")
+	assert.NoError(err)
+	assert.Equal(http.StatusBadRequest, response.StatusCode)
+
+	err = api.DeactivateWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID)
+	assert.NoError(err)
+	entities, err = api.GetWebhookEntities(workflow.ID, formNode.WebhookId)
+	assert.NoError(err)
+	assert.Empty(entities)
+
+	err = api.ActivateWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID)
+	assert.NoError(err)
+	err = api.DeleteWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID)
+	assert.NoError(err)
+	deleted = true
+	entities, err = api.GetWebhookEntities(workflow.ID, formNode.WebhookId)
+	assert.NoError(err)
+	assert.Empty(entities)
+}
+
+func (s *WebhookTestSuite) TestFormTriggerPOSTExecutesSingleNodeWorkflow() {
+	assert := require.New(s.T())
+	organization := structs.CreateOrganization_Testing(rdsDbQueries, sid, "")
+	workflow, err := api.CreateWorkflow_Testing(
+		testFiberLambda, organization.ID, "./test_files/workflow_execution_form_trigger_single.json")
+	assert.NoError(err)
+	assert.NotNil(workflow)
+	defer func() {
+		_ = api.DeleteWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID)
+	}()
+	assert.NoError(api.ActivateWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID))
+
+	formNode := workflow.Nodes[0]
+	response, err := api.CallWebhookWithContentTypeFullResponse_Testing(
+		testFiberLambda,
+		http.MethodPost,
+		workflow.ID,
+		formNode.ID,
+		formNode.WebhookId,
+		false,
+		"application/x-www-form-urlencoded",
+		"field-0=++Alice++&field-1=++alice%40example.com++&field-2=Support",
+	)
+	assert.NoError(err)
+	assert.Equal(http.StatusOK, response.StatusCode)
+	responseBody := map[string]string{}
+	assert.NoError(json.Unmarshal([]byte(response.Body), &responseBody))
+	assert.Equal("Workflow was started", responseBody["message"])
+	executionID := responseBody["executionId"]
+	assert.NotEmpty(executionID)
+
+	var execution *structs.WorkflowExecution
+	assert.Eventually(func() bool {
+		execution, err = api.GetWorkflowExecution_Testing(testFiberLambda, organization.ID, executionID)
+		return err == nil && execution.Status == structs.WorkflowExecutionStatus_Success
+	}, 10*time.Second, 100*time.Millisecond)
+
+	formRuns := execution.Data.ResultData.RunData["Form Trigger"]
+	assert.Len(formRuns, 1)
+	output := formRuns[0].Data["main"][0][0]["json"].(map[string]interface{})
+	assert.Equal("Alice", output["Name"])
+	assert.Equal("alice@example.com", output["Email"])
+	assert.Equal("Support", output["Department"])
+	assert.Contains(output, "Optional note")
+	assert.Nil(output["Optional note"])
+	assert.Equal("production", output["formMode"])
+	_, err = time.Parse(time.RFC3339, output["submittedAt"].(string))
+	assert.NoError(err)
+}
+
+func (s *WebhookTestSuite) TestFormTriggerPOSTPropagatesToDownstreamNode() {
+	assert := require.New(s.T())
+	organization := structs.CreateOrganization_Testing(rdsDbQueries, sid, "")
+	workflow, err := api.CreateWorkflow_Testing(
+		testFiberLambda, organization.ID, "./test_files/workflow_execution_form_trigger_downstream.json")
+	assert.NoError(err)
+	assert.NotNil(workflow)
+	defer func() {
+		_ = api.DeleteWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID)
+	}()
+	assert.NoError(api.ActivateWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID))
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	assert.NoError(writer.WriteField("field-0", "Alice"))
+	assert.NoError(writer.WriteField("field-1", "Support"))
+	assert.NoError(writer.Close())
+	formNode := workflow.Nodes[0]
+	response, err := api.CallWebhookWithContentTypeFullResponse_Testing(
+		testFiberLambda,
+		http.MethodPost,
+		workflow.ID,
+		formNode.ID,
+		formNode.WebhookId,
+		false,
+		writer.FormDataContentType(),
+		body.String(),
+	)
+	assert.NoError(err)
+	assert.Equal(http.StatusOK, response.StatusCode)
+	responseBody := map[string]string{}
+	assert.NoError(json.Unmarshal([]byte(response.Body), &responseBody))
+	executionID := responseBody["executionId"]
+	assert.NotEmpty(executionID)
+
+	var execution *structs.WorkflowExecution
+	assert.Eventually(func() bool {
+		execution, err = api.GetWorkflowExecution_Testing(testFiberLambda, organization.ID, executionID)
+		return err == nil && execution.Status == structs.WorkflowExecutionStatus_Success
+	}, 10*time.Second, 100*time.Millisecond)
+
+	codeRuns := execution.Data.ResultData.RunData["Code"]
+	assert.Len(codeRuns, 1)
+	output := codeRuns[0].Data["main"][0][0]["json"].(map[string]interface{})
+	assert.Equal("Alice", output["propagatedName"])
+	assert.Equal("Support", output["propagatedDepartment"])
+	assert.Equal("production", output["propagatedMode"])
 }

@@ -4,14 +4,16 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 
-	"github.com/AzureAD/microsoft-authentication-library-for-go/apps/errors"
 	rdsDbLib "github.com/sugerio/workflow-service-trial/rds-db/lib"
 	"github.com/sugerio/workflow-service-trial/shared/structs"
 )
+
+var ErrWebhookMethodNotAllowed = errors.New("the http method is not allowed for this webhook")
 
 type (
 	// Webhook node options
@@ -60,24 +62,33 @@ func GetWorkflowWebhooks(workflowEntity *structs.WorkflowEntity, isTest bool) []
 				continue
 			}
 
-			// If the node is a webhook, add it to the result.
-			results = append(
-				results,
-				structs.WebhookData{
-					HttpMethod: getWebhookMethod(&node),
+			// Each webhook description has its own method-specific identity.
+			for _, webhookDescription := range webhooks {
+				results = append(results, structs.WebhookData{
+					HttpMethod: resolveWebhookMethod(&node, webhookDescription),
 					Node:       node.Name,
 					NodeType:   node.Type,
 					NodeId:     node.ID,
-					// The webhook path is the webhookId by default
+					// The webhook path is the webhookId by default.
 					Path:                            getWebhookPath(node.WebhookId, isTest),
+					WebhookDescription:              webhookDescription,
 					WorkflowId:                      workflowEntity.ID,
 					WebhookId:                       node.WebhookId,
 					WorkflowExecutionAdditionalData: structs.WorkflowExecuteAdditionalData{},
 					IsTest:                          isTest,
 				})
+			}
 		}
 	}
 	return results
+}
+
+func resolveWebhookMethod(node *structs.WorkflowNode, description structs.WebhookDescription) string {
+	method := strings.TrimSpace(description.HttpMethod)
+	if method != "" && !strings.HasPrefix(method, "={{") {
+		return method
+	}
+	return getWebhookMethod(node)
 }
 
 // Create the webhook if it does not exist.
@@ -198,7 +209,7 @@ func getWebhookPath(webhookId string, isTest bool) string {
 // Get online or test webhook entity by webhookId
 func GetWebhookEntity(
 	ctx context.Context, workflowId string,
-	webhookId string, isTest bool) (*rdsDbLib.WorkflowWebhookEntity, error) {
+	webhookId string, isTest bool, method string) (*rdsDbLib.WorkflowWebhookEntity, error) {
 	// Read from db, it will return online and test webhook if exists
 	webhookEitities, err := GetRdsDbQueries().ListWebhookEntities(
 		ctx,
@@ -215,10 +226,18 @@ func GetWebhookEntity(
 
 	// Filter target online or test webhook
 	targetWebhookPath := getWebhookPath(webhookId, isTest)
+	foundIdentity := false
 	for _, webhookEntity := range webhookEitities {
 		if targetWebhookPath == webhookEntity.WebhookPath {
+			foundIdentity = true
+			if webhookEntity.Method != method {
+				continue
+			}
 			return &webhookEntity, nil
 		}
+	}
+	if foundIdentity {
+		return nil, ErrWebhookMethodNotAllowed
 	}
 	return nil, fmt.Errorf("no such webhook")
 }

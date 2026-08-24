@@ -1,0 +1,52 @@
+{
+  "name": "Single Form Trigger",
+  "active": false,
+  "connections": {},
+  "nodes": [
+    {
+      "id": "form-trigger-node",
+      "name": "Form Trigger",
+      "typeVersion": 2,
+      "type": "n8n-nodes-base.formTrigger",
+      "position": [420, 200],
+      "parameters": {
+        "path": "contact",
+        "formTitle": "Contact us",
+        "formDescription": "We will get back to you soon. <script>alert(\"description\")</script>",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Name",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Email",
+              "fieldType": "email"
+            },
+            {
+              "fieldLabel": "Department",
+              "fieldType": "dropdown",
+              "fieldOptions": {
+                "values": [
+                  { "option": "Sales" },
+                  { "option": "Support" }
+                ]
+              }
+            },
+            {
+              "fieldLabel": "Optional note",
+              "fieldType": "text"
+            }
+          ]
+        },
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "webhookId": "form-trigger-webhook"
+    }
+  ],
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

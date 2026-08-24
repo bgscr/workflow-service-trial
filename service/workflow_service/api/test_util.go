@@ -385,12 +385,26 @@ func CallWebhookFullResponse_Testing(
 	isTest bool,
 	body string,
 ) (events.APIGatewayProxyResponse, error) {
+	return CallWebhookWithContentTypeFullResponse_Testing(
+		testFiberLambda, httpMethod, workflowId, nodeId, webhookId, isTest, "application/json", body)
+}
+
+func CallWebhookWithContentTypeFullResponse_Testing(
+	testFiberLambda *fiberAdapter.FiberLambda,
+	httpMethod string,
+	workflowId string,
+	nodeId string,
+	webhookId string,
+	isTest bool,
+	contentType string,
+	body string,
+) (events.APIGatewayProxyResponse, error) {
 	request := events.APIGatewayProxyRequest{
 		HTTPMethod:            httpMethod,
 		Path:                  fmt.Sprintf("/workflow/public/webhook/workflow/%s/node/%s", workflowId, nodeId),
 		QueryStringParameters: map[string]string{"webhookId": webhookId, "isTest": strconv.FormatBool(isTest)},
 		Body:                  body,
-		Headers:               map[string]string{"Content-Type": "application/json"},
+		Headers:               map[string]string{"Content-Type": contentType},
 		RequestContext:        AuthorizerRequestContext,
 	}
 	return testFiberLambda.Proxy(request)

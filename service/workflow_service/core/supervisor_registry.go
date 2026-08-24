@@ -39,6 +39,11 @@ type NodeWebhookMethods interface {
 	WebhookMethods() *structs.NodeWebhookMethods
 }
 
+// NodeFormRenderer is an optional capability for nodes that render a public form.
+type NodeFormRenderer interface {
+	RenderForm(node *structs.WorkflowNode, actionURL string) ([]byte, error)
+}
+
 type TriggerObject interface {
 	Trigger(ctx context.Context, input *structs.WorkflowNode) string
 }

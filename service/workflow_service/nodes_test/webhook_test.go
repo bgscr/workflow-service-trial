@@ -76,6 +76,7 @@ func (s *WebhookTestSuite) Test() {
 		webhookEitities, err := api.GetWebhookEntities(workflowID, webhookId)
 		assert.Nil(err)
 		assert.Equal(1, len(webhookEitities))
+		assert.Equal(http.MethodPost, webhookEitities[0].Method)
 
 		// Call Test Webhook (isTest=true)
 		response, err := api.CallWebhook_Testing(testFiberLambda, http.MethodPost, workflowID, nodeId, webhookId,
