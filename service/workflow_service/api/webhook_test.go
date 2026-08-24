@@ -286,7 +286,7 @@ func (s *WebhookTestSuite) TestFormTriggerGET() {
 	assert.Zero(document.Find("script").Length())
 	form := document.Find("form")
 	assert.Equal("post", form.AttrOr("method", ""))
-	assert.Contains(form.AttrOr("action", ""), "webhookId=form-trigger-webhook")
+	assert.Contains(form.AttrOr("action", ""), "webhookId="+formNode.WebhookId)
 	assert.Contains(form.AttrOr("action", ""), "isTest=false")
 	assert.Equal("text", document.Find(`input[name="field-0"]`).AttrOr("type", ""))
 	assert.Equal("email", document.Find(`input[name="field-1"]`).AttrOr("type", ""))
