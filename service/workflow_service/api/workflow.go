@@ -128,45 +128,36 @@ func (service *WorkflowService) UpdateWorkflow(c *fiber.Ctx) error {
 
 	// Just update active, handle the webhook register/unregister and return.
 	if onlyUpdateActive {
-		// Call hook "workflow.update" here
-		workflowEntityUpdated_RdsDbLib, err := service.rdsDbQueries.UpdateWorkflowEntityActive(
-			c.UserContext(),
-			rdsDbLib.UpdateWorkflowEntityActiveParams{
-				SugerOrgId: orgId,
-				ID:         workflowId,
-				Active:     params.Active,
-			})
-		if err != nil {
-			return HandleInternalServerErrorWithTrace(c, err)
-		}
-		workflowEntityUpdated, err := structs.ToWorkflowEntity(workflowEntityUpdated_RdsDbLib)
-		if err != nil {
-			return HandleInternalServerErrorWithTrace(c, err)
-		}
-
-		// Call hook "workflow.afterUpdate"
+		workflowEntityForTemporal := *workflowEntity
+		workflowEntityForTemporal.Active = params.Active
 		if params.Active {
 			// Set up temporal workflow for active schedule trigger.
-			err := temporal.SetupTemporalWorkflow_ScheduleTrigger(c.UserContext(), &workflowEntityUpdated)
-			if err != nil {
-				return HandleInternalServerErrorWithTrace(c, err)
-			}
-			// For webhook trigger, register the workflow runner.
-			err = core.RegisterWebhook(c.UserContext(), workflowId, false)
+			err := temporal.SetupTemporalWorkflow_ScheduleTrigger(c.UserContext(), &workflowEntityForTemporal)
 			if err != nil {
 				return HandleInternalServerErrorWithTrace(c, err)
 			}
 		} else {
-			err := temporal.TerminateTemporalWorkflow_ScheduleTrigger(c.UserContext(), &workflowEntityUpdated)
+			err := temporal.TerminateTemporalWorkflow_ScheduleTrigger(c.UserContext(), &workflowEntityForTemporal)
 			if err != nil {
 				return HandleInternalServerErrorWithTrace(c, err)
 			}
+		}
 
-			// For webhook trigger, unregister the workflow runner.
-			err = core.UnregisterWebhook(c.UserContext(), workflowId, false)
-			if err != nil {
-				return HandleInternalServerErrorWithTrace(c, err)
+		_, err = core.UpdateWorkflowActiveWithWebhooks(
+			c.UserContext(), workflowEntity, params.Active)
+		if err != nil {
+			var compensationErr error
+			if params.Active {
+				compensationErr = temporal.TerminateTemporalWorkflow_ScheduleTrigger(
+					c.UserContext(), &workflowEntityForTemporal)
+			} else {
+				compensationErr = temporal.SetupTemporalWorkflow_ScheduleTrigger(
+					c.UserContext(), &workflowEntityForTemporal)
 			}
+			if compensationErr != nil {
+				err = fmt.Errorf("%w; temporal compensation failed: %v", err, compensationErr)
+			}
+			return HandleInternalServerErrorWithTrace(c, err)
 		}
 
 		workflowEntity, err = core.GetWorkflowEntity(c.UserContext(), orgId, workflowId)
