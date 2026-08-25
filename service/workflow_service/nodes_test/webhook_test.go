@@ -76,6 +76,7 @@ func (s *WebhookTestSuite) Test() {
 		webhookEitities, err := api.GetWebhookEntities(workflowID, webhookId)
 		assert.Nil(err)
 		assert.Equal(1, len(webhookEitities))
+		assert.Equal(http.MethodPost, webhookEitities[0].Method)
 
 		// Call Test Webhook (isTest=true)
 		response, err := api.CallWebhook_Testing(testFiberLambda, http.MethodPost, workflowID, nodeId, webhookId,
@@ -200,14 +201,27 @@ func (s *WebhookTestSuite) Test() {
 			testFiberLambda, organization.ID, "./test_files/webhook-multiple-e2e.json")
 		assert.Nil(err)
 		assert.NotNil(newWorkflow)
+		assert.True(newWorkflow.Active)
+
+		nodeToWebhook, err := api.GetAllWebhookIdAndNodeIdInWorkflow(newWorkflow)
+		assert.Nil(err)
+		assert.Equal(2, len(nodeToWebhook))
+		for _, webhookID := range nodeToWebhook {
+			webhookEntities, err := api.GetWebhookEntities(newWorkflow.ID, webhookID)
+			assert.Nil(err)
+			assert.Empty(webhookEntities)
+		}
 
 		// Active the workflow
 		err = api.ActivateWorkflow_Testing(testFiberLambda, organization.ID, newWorkflow.ID)
 		assert.Nil(err)
 
-		nodeToWebhook, err := api.GetAllWebhookIdAndNodeIdInWorkflow(newWorkflow)
-		assert.Nil(err)
-		assert.Equal(2, len(nodeToWebhook))
+		for _, webhookID := range nodeToWebhook {
+			webhookEntities, err := api.GetWebhookEntities(newWorkflow.ID, webhookID)
+			assert.Nil(err)
+			assert.Len(webhookEntities, 1)
+			assert.Equal(http.MethodPost, webhookEntities[0].Method)
+		}
 
 		// Get the workflow execution. it should be empty because the webhook is not called yet.
 		count, err := rdsDbQueries.CountWorkflowExecutionEntitiesByWorkflowId(context.Background(), newWorkflow.ID)

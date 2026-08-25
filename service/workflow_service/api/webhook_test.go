@@ -4,11 +4,16 @@ package api_test
 // go test -v service/workflow_service/api/service_test.go service/workflow_service/api/webhook_test.go
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"mime/multipart"
 	"net/http"
+	"sort"
 	"testing"
 	"time"
 
+	"github.com/PuerkitoBio/goquery"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 
@@ -233,4 +238,459 @@ func (s *WebhookTestSuite) TestHandleWebhook() {
 			"TypeError: Cannot read property 'split' of undefined or null [line 2]",
 			webhookResponseBody["message"].(string))
 	})
+}
+
+func (s *WebhookTestSuite) TestFormTriggerGET() {
+	assert := require.New(s.T())
+	organization := structs.CreateOrganization_Testing(rdsDbQueries, sid, "")
+	workflow, err := api.CreateWorkflow_Testing(
+		testFiberLambda, organization.ID, "./test_files/workflow_execution_form_trigger_single.json")
+	assert.NoError(err)
+	assert.NotNil(workflow)
+	deleted := false
+	s.T().Cleanup(func() {
+		if !deleted {
+			assert.NoError(api.DeleteWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID))
+		}
+	})
+
+	err = api.ActivateWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID)
+	assert.NoError(err)
+
+	formNode := workflow.Nodes[0]
+	entities, err := api.GetWebhookEntities(workflow.ID, formNode.WebhookId)
+	assert.NoError(err)
+	methods := make([]string, 0, len(entities))
+	for _, entity := range entities {
+		methods = append(methods, entity.Method)
+	}
+	sort.Strings(methods)
+	assert.Equal([]string{http.MethodGet, http.MethodPost}, methods)
+
+	countBefore, err := rdsDbQueries.CountWorkflowExecutionEntitiesByWorkflowId(context.Background(), workflow.ID)
+	assert.NoError(err)
+	response, err := api.CallWebhookFullResponse_Testing(
+		testFiberLambda, http.MethodGet, workflow.ID, formNode.ID, formNode.WebhookId, false, "")
+	assert.NoError(err)
+	assert.Equal(http.StatusOK, response.StatusCode)
+	assert.Contains(response.MultiValueHeaders["Content-Type"], "text/html; charset=utf-8")
+
+	document, err := goquery.NewDocumentFromReader(bytes.NewBufferString(response.Body))
+	assert.NoError(err)
+	assert.Equal("Contact us", document.Find("title").Text())
+	assert.Equal("Contact us", document.Find("h1").Text())
+	assert.Equal(
+		"We will get back to you soon. <script>alert(\"description\")</script>",
+		document.Find("p").First().Text(),
+	)
+	assert.Zero(document.Find("script").Length())
+	form := document.Find("form")
+	assert.Equal("post", form.AttrOr("method", ""))
+	assert.Contains(form.AttrOr("action", ""), "webhookId="+formNode.WebhookId)
+	assert.Contains(form.AttrOr("action", ""), "isTest=false")
+	assert.Equal("text", document.Find(`input[name="field-0"]`).AttrOr("type", ""))
+	assert.Equal("email", document.Find(`input[name="field-1"]`).AttrOr("type", ""))
+	assert.Equal(2, document.Find(`select[name="field-2"] option`).Length())
+
+	countAfter, err := rdsDbQueries.CountWorkflowExecutionEntitiesByWorkflowId(context.Background(), workflow.ID)
+	assert.NoError(err)
+	assert.Equal(countBefore, countAfter)
+
+	response, err = api.CallWebhookFullResponse_Testing(
+		testFiberLambda, http.MethodPut, workflow.ID, formNode.ID, formNode.WebhookId, false, "")
+	assert.NoError(err)
+	assert.Equal(http.StatusBadRequest, response.StatusCode)
+
+	err = api.DeactivateWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID)
+	assert.NoError(err)
+	persistedWorkflow, err := api.GetWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID)
+	assert.NoError(err)
+	assert.False(persistedWorkflow.Active)
+	entities, err = api.GetWebhookEntities(workflow.ID, formNode.WebhookId)
+	assert.NoError(err)
+	assert.Empty(entities)
+	response, err = api.CallWebhookFullResponse_Testing(
+		testFiberLambda, http.MethodGet, workflow.ID, formNode.ID, formNode.WebhookId, false, "")
+	assert.NoError(err)
+	assert.Equal(http.StatusNotFound, response.StatusCode)
+	response, err = api.CallWebhookWithContentTypeFullResponse_Testing(
+		testFiberLambda,
+		http.MethodPost,
+		workflow.ID,
+		formNode.ID,
+		formNode.WebhookId,
+		false,
+		"application/x-www-form-urlencoded",
+		"field-0=Alice&field-1=alice%40example.com&field-2=Support",
+	)
+	assert.NoError(err)
+	assert.Equal(http.StatusNotFound, response.StatusCode)
+
+	err = api.ActivateWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID)
+	assert.NoError(err)
+	err = api.DeleteWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID)
+	assert.NoError(err)
+	deleted = true
+	_, err = api.GetWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID)
+	assert.Error(err)
+	entities, err = api.GetWebhookEntities(workflow.ID, formNode.WebhookId)
+	assert.NoError(err)
+	assert.Empty(entities)
+	response, err = api.CallWebhookFullResponse_Testing(
+		testFiberLambda, http.MethodGet, workflow.ID, formNode.ID, formNode.WebhookId, false, "")
+	assert.NoError(err)
+	assert.Equal(http.StatusNotFound, response.StatusCode)
+	response, err = api.CallWebhookWithContentTypeFullResponse_Testing(
+		testFiberLambda,
+		http.MethodPost,
+		workflow.ID,
+		formNode.ID,
+		formNode.WebhookId,
+		false,
+		"application/x-www-form-urlencoded",
+		"field-0=Alice&field-1=alice%40example.com&field-2=Support",
+	)
+	assert.NoError(err)
+	assert.Equal(http.StatusNotFound, response.StatusCode)
+}
+
+func (s *WebhookTestSuite) TestFormTriggerActivationRollsBackWhenSecondWebhookInsertFails() {
+	t := s.T()
+	assert := require.New(t)
+	organization := structs.CreateOrganization_Testing(rdsDbQueries, sid, "")
+	workflow, err := api.CreateWorkflow_Testing(
+		testFiberLambda, organization.ID, "./test_files/workflow_execution_form_trigger_single.json")
+	assert.NoError(err)
+	assert.NotNil(workflow)
+	t.Cleanup(func() {
+		assert.NoError(api.DeleteWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID))
+	})
+
+	_, err = testRdsDb.ExecContext(context.Background(), `
+		CREATE FUNCTION workflow.fail_form_trigger_post_insert() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.method = 'POST' THEN
+				RAISE EXCEPTION 'forced POST webhook insert failure';
+			END IF;
+			RETURN NEW;
+		END;
+		$$;
+		CREATE TRIGGER fail_form_trigger_post_insert
+		BEFORE INSERT ON workflow.webhook_entity
+		FOR EACH ROW EXECUTE FUNCTION workflow.fail_form_trigger_post_insert();
+	`)
+	assert.NoError(err)
+	t.Cleanup(func() {
+		_, cleanupErr := testRdsDb.ExecContext(context.Background(), `
+			DROP TRIGGER fail_form_trigger_post_insert ON workflow.webhook_entity;
+			DROP FUNCTION workflow.fail_form_trigger_post_insert();
+		`)
+		assert.NoError(cleanupErr)
+	})
+
+	err = api.ActivateWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID)
+	assert.Error(err)
+
+	formNode := workflow.Nodes[0]
+	persistedWorkflow, err := api.GetWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID)
+	assert.NoError(err)
+	assert.False(persistedWorkflow.Active)
+
+	entities, err := api.GetWebhookEntities(workflow.ID, formNode.WebhookId)
+	assert.NoError(err)
+	assert.Empty(entities)
+
+	getResponse, err := api.CallWebhookFullResponse_Testing(
+		testFiberLambda, http.MethodGet, workflow.ID, formNode.ID, formNode.WebhookId, false, "")
+	assert.NoError(err)
+	assert.Equal(http.StatusNotFound, getResponse.StatusCode)
+	postResponse, err := api.CallWebhookWithContentTypeFullResponse_Testing(
+		testFiberLambda,
+		http.MethodPost,
+		workflow.ID,
+		formNode.ID,
+		formNode.WebhookId,
+		false,
+		"application/x-www-form-urlencoded",
+		"field-0=Alice&field-1=alice%40example.com&field-2=Support",
+	)
+	assert.NoError(err)
+	assert.Equal(http.StatusNotFound, postResponse.StatusCode)
+}
+
+func (s *WebhookTestSuite) TestFormTriggerDeactivationRollsBackWhenSecondWebhookDeleteFails() {
+	t := s.T()
+	assert := require.New(t)
+	organization := structs.CreateOrganization_Testing(rdsDbQueries, sid, "")
+	workflow, err := api.CreateWorkflow_Testing(
+		testFiberLambda, organization.ID, "./test_files/workflow_execution_form_trigger_single.json")
+	assert.NoError(err)
+	assert.NotNil(workflow)
+	t.Cleanup(func() {
+		assert.NoError(api.DeleteWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID))
+	})
+	assert.NoError(api.ActivateWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID))
+
+	formNode := workflow.Nodes[0]
+	entities, err := api.GetWebhookEntities(workflow.ID, formNode.WebhookId)
+	assert.NoError(err)
+	assert.Len(entities, 2)
+	getResponseBefore, err := api.CallWebhookFullResponse_Testing(
+		testFiberLambda, http.MethodGet, workflow.ID, formNode.ID, formNode.WebhookId, false, "")
+	assert.NoError(err)
+	assert.Equal(http.StatusOK, getResponseBefore.StatusCode)
+	postResponseBefore, err := api.CallWebhookWithContentTypeFullResponse_Testing(
+		testFiberLambda,
+		http.MethodPost,
+		workflow.ID,
+		formNode.ID,
+		formNode.WebhookId,
+		false,
+		"application/x-www-form-urlencoded",
+		"field-0=Alice&field-1=alice%40example.com&field-2=Support",
+	)
+	assert.NoError(err)
+	assert.Equal(http.StatusOK, postResponseBefore.StatusCode)
+	waitForFormTriggerExecution(t, organization.ID, postResponseBefore.Body)
+
+	_, err = testRdsDb.ExecContext(context.Background(), `
+		CREATE FUNCTION workflow.fail_form_trigger_post_delete() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			IF OLD.method = 'POST' THEN
+				RAISE EXCEPTION 'forced POST webhook delete failure';
+			END IF;
+			RETURN OLD;
+		END;
+		$$;
+		CREATE TRIGGER fail_form_trigger_post_delete
+		BEFORE DELETE ON workflow.webhook_entity
+		FOR EACH ROW EXECUTE FUNCTION workflow.fail_form_trigger_post_delete();
+	`)
+	assert.NoError(err)
+	t.Cleanup(func() {
+		_, cleanupErr := testRdsDb.ExecContext(context.Background(), `
+			DROP TRIGGER fail_form_trigger_post_delete ON workflow.webhook_entity;
+			DROP FUNCTION workflow.fail_form_trigger_post_delete();
+		`)
+		assert.NoError(cleanupErr)
+	})
+
+	err = api.DeactivateWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID)
+	assert.Error(err)
+	persistedWorkflow, err := api.GetWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID)
+	assert.NoError(err)
+	assert.True(persistedWorkflow.Active)
+
+	entities, err = api.GetWebhookEntities(workflow.ID, formNode.WebhookId)
+	assert.NoError(err)
+	methods := make([]string, 0, len(entities))
+	for _, entity := range entities {
+		methods = append(methods, entity.Method)
+	}
+	sort.Strings(methods)
+	assert.Equal([]string{http.MethodGet, http.MethodPost}, methods)
+
+	getResponseAfter, err := api.CallWebhookFullResponse_Testing(
+		testFiberLambda, http.MethodGet, workflow.ID, formNode.ID, formNode.WebhookId, false, "")
+	assert.NoError(err)
+	assert.Equal(getResponseBefore.StatusCode, getResponseAfter.StatusCode)
+	postResponseAfter, err := api.CallWebhookWithContentTypeFullResponse_Testing(
+		testFiberLambda,
+		http.MethodPost,
+		workflow.ID,
+		formNode.ID,
+		formNode.WebhookId,
+		false,
+		"application/x-www-form-urlencoded",
+		"field-0=Alice&field-1=alice%40example.com&field-2=Support",
+	)
+	assert.NoError(err)
+	assert.Equal(postResponseBefore.StatusCode, postResponseAfter.StatusCode)
+	waitForFormTriggerExecution(t, organization.ID, postResponseAfter.Body)
+}
+
+func (s *WebhookTestSuite) TestFormTriggerWorkflowDeletionFailsWhenWebhookDeletionFails() {
+	t := s.T()
+	assert := require.New(t)
+	organization := structs.CreateOrganization_Testing(rdsDbQueries, sid, "")
+	workflow, err := api.CreateWorkflow_Testing(
+		testFiberLambda, organization.ID, "./test_files/workflow_execution_form_trigger_single.json")
+	assert.NoError(err)
+	assert.NotNil(workflow)
+	workflowDeleted := false
+	t.Cleanup(func() {
+		if !workflowDeleted {
+			assert.NoError(api.DeleteWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID))
+		}
+	})
+	assert.NoError(api.ActivateWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID))
+
+	_, err = testRdsDb.ExecContext(context.Background(), `
+		CREATE FUNCTION workflow.fail_form_trigger_post_delete() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			IF OLD.method = 'POST' THEN
+				RAISE EXCEPTION 'forced POST webhook delete failure';
+			END IF;
+			RETURN OLD;
+		END;
+		$$;
+		CREATE TRIGGER fail_form_trigger_post_delete
+		BEFORE DELETE ON workflow.webhook_entity
+		FOR EACH ROW EXECUTE FUNCTION workflow.fail_form_trigger_post_delete();
+	`)
+	assert.NoError(err)
+	t.Cleanup(func() {
+		_, cleanupErr := testRdsDb.ExecContext(context.Background(), `
+			DROP TRIGGER fail_form_trigger_post_delete ON workflow.webhook_entity;
+			DROP FUNCTION workflow.fail_form_trigger_post_delete();
+		`)
+		assert.NoError(cleanupErr)
+	})
+
+	err = api.DeleteWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID)
+	assert.Error(err)
+	formNode := workflow.Nodes[0]
+	persistedWorkflow, err := api.GetWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID)
+	assert.NoError(err)
+	assert.True(persistedWorkflow.Active)
+	entities, err := api.GetWebhookEntities(workflow.ID, formNode.WebhookId)
+	assert.NoError(err)
+	methods := make([]string, 0, len(entities))
+	for _, entity := range entities {
+		methods = append(methods, entity.Method)
+	}
+	sort.Strings(methods)
+	assert.Equal([]string{http.MethodGet, http.MethodPost}, methods)
+	getResponse, err := api.CallWebhookFullResponse_Testing(
+		testFiberLambda, http.MethodGet, workflow.ID, formNode.ID, formNode.WebhookId, false, "")
+	assert.NoError(err)
+	assert.Equal(http.StatusOK, getResponse.StatusCode)
+	postResponse, err := api.CallWebhookWithContentTypeFullResponse_Testing(
+		testFiberLambda,
+		http.MethodPost,
+		workflow.ID,
+		formNode.ID,
+		formNode.WebhookId,
+		false,
+		"application/x-www-form-urlencoded",
+		"field-0=Alice&field-1=alice%40example.com&field-2=Support",
+	)
+	assert.NoError(err)
+	assert.Equal(http.StatusOK, postResponse.StatusCode)
+	waitForFormTriggerExecution(t, organization.ID, postResponse.Body)
+}
+
+func waitForFormTriggerExecution(t *testing.T, organizationID, responseBody string) {
+	t.Helper()
+	assert := require.New(t)
+	body := map[string]string{}
+	assert.NoError(json.Unmarshal([]byte(responseBody), &body))
+	executionID := body["executionId"]
+	assert.NotEmpty(executionID)
+	assert.Eventually(func() bool {
+		execution, err := api.GetWorkflowExecution_Testing(testFiberLambda, organizationID, executionID)
+		return err == nil && execution.Status == structs.WorkflowExecutionStatus_Success
+	}, 10*time.Second, 100*time.Millisecond)
+}
+
+func (s *WebhookTestSuite) TestFormTriggerPOSTExecutesSingleNodeWorkflow() {
+	assert := require.New(s.T())
+	organization := structs.CreateOrganization_Testing(rdsDbQueries, sid, "")
+	workflow, err := api.CreateWorkflow_Testing(
+		testFiberLambda, organization.ID, "./test_files/workflow_execution_form_trigger_single.json")
+	assert.NoError(err)
+	assert.NotNil(workflow)
+	s.T().Cleanup(func() {
+		assert.NoError(api.DeleteWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID))
+	})
+	assert.NoError(api.ActivateWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID))
+
+	formNode := workflow.Nodes[0]
+	response, err := api.CallWebhookWithContentTypeFullResponse_Testing(
+		testFiberLambda,
+		http.MethodPost,
+		workflow.ID,
+		formNode.ID,
+		formNode.WebhookId,
+		false,
+		"application/x-www-form-urlencoded",
+		"field-0=SubscriptionConfirmation&field-1=++alice%40example.com++&field-2=Support",
+	)
+	assert.NoError(err)
+	assert.Equal(http.StatusOK, response.StatusCode)
+	responseBody := map[string]string{}
+	assert.NoError(json.Unmarshal([]byte(response.Body), &responseBody))
+	assert.Equal("Workflow was started", responseBody["message"])
+	executionID := responseBody["executionId"]
+	assert.NotEmpty(executionID)
+
+	var execution *structs.WorkflowExecution
+	assert.Eventually(func() bool {
+		execution, err = api.GetWorkflowExecution_Testing(testFiberLambda, organization.ID, executionID)
+		return err == nil && execution.Status == structs.WorkflowExecutionStatus_Success
+	}, 10*time.Second, 100*time.Millisecond)
+
+	formRuns := execution.Data.ResultData.RunData["Form Trigger"]
+	assert.Len(formRuns, 1)
+	output := formRuns[0].Data["main"][0][0]["json"].(map[string]interface{})
+	assert.Equal("SubscriptionConfirmation", output["Name"])
+	assert.Equal("alice@example.com", output["Email"])
+	assert.Equal("Support", output["Department"])
+	assert.Contains(output, "Optional note")
+	assert.Nil(output["Optional note"])
+	assert.Equal("production", output["formMode"])
+	_, err = time.Parse(time.RFC3339, output["submittedAt"].(string))
+	assert.NoError(err)
+}
+
+func (s *WebhookTestSuite) TestFormTriggerPOSTPropagatesToDownstreamNode() {
+	assert := require.New(s.T())
+	organization := structs.CreateOrganization_Testing(rdsDbQueries, sid, "")
+	workflow, err := api.CreateWorkflow_Testing(
+		testFiberLambda, organization.ID, "./test_files/workflow_execution_form_trigger_downstream.json")
+	assert.NoError(err)
+	assert.NotNil(workflow)
+	s.T().Cleanup(func() {
+		assert.NoError(api.DeleteWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID))
+	})
+	assert.NoError(api.ActivateWorkflow_Testing(testFiberLambda, organization.ID, workflow.ID))
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	assert.NoError(writer.WriteField("field-0", "SubscriptionConfirmation"))
+	assert.NoError(writer.WriteField("field-1", "Support"))
+	assert.NoError(writer.Close())
+	formNode := workflow.Nodes[0]
+	response, err := api.CallWebhookWithContentTypeFullResponse_Testing(
+		testFiberLambda,
+		http.MethodPost,
+		workflow.ID,
+		formNode.ID,
+		formNode.WebhookId,
+		false,
+		writer.FormDataContentType(),
+		body.String(),
+	)
+	assert.NoError(err)
+	assert.Equal(http.StatusOK, response.StatusCode)
+	responseBody := map[string]string{}
+	assert.NoError(json.Unmarshal([]byte(response.Body), &responseBody))
+	executionID := responseBody["executionId"]
+	assert.NotEmpty(executionID)
+
+	var execution *structs.WorkflowExecution
+	assert.Eventually(func() bool {
+		execution, err = api.GetWorkflowExecution_Testing(testFiberLambda, organization.ID, executionID)
+		return err == nil && execution.Status == structs.WorkflowExecutionStatus_Success
+	}, 10*time.Second, 100*time.Millisecond)
+
+	codeRuns := execution.Data.ResultData.RunData["Code"]
+	assert.Len(codeRuns, 1)
+	output := codeRuns[0].Data["main"][0][0]["json"].(map[string]interface{})
+	assert.Equal("SubscriptionConfirmation", output["propagatedName"])
+	assert.Equal("Support", output["propagatedDepartment"])
+	assert.Equal("production", output["propagatedMode"])
 }

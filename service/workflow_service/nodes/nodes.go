@@ -5,6 +5,7 @@ import (
 	_ "github.com/sugerio/workflow-service-trial/service/workflow_service/nodes/code"
 	_ "github.com/sugerio/workflow-service-trial/service/workflow_service/nodes/delete_execution"
 	_ "github.com/sugerio/workflow-service-trial/service/workflow_service/nodes/filter"
+	_ "github.com/sugerio/workflow-service-trial/service/workflow_service/nodes/form_trigger"
 	_ "github.com/sugerio/workflow-service-trial/service/workflow_service/nodes/html"
 	_ "github.com/sugerio/workflow-service-trial/service/workflow_service/nodes/http_request"
 	_ "github.com/sugerio/workflow-service-trial/service/workflow_service/nodes/if"

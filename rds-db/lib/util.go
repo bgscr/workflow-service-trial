@@ -6,11 +6,13 @@ package lib
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/XSAM/otelsql"
 	"github.com/docker/go-connections/nat"
@@ -33,6 +35,8 @@ const (
 	TEST_POSTGRES_PORT          = "5432/tcp"
 	TEST_POSTGRES_DB_URL_FORMAT = "postgres://%s:%s@localhost:%s/%s?sslmode=disable"
 )
+
+const workflowLifecycleLockNamespace int32 = 0x77666c63
 
 // sqlDDLAndDMLPattern is a regex pattern to match SQL write operations.
 const sqlDDLAndDMLPattern = `(?i)(insert\s+into|update|delete\s+from|create\s+table|create\s+index|create\s+view|create\s+schema|alter\s+table|drop\s+table|drop\s+index|drop\s+view|drop\s+schema|truncate\s+table|copy\s+\w+\s+from|rename\s+table)\s+`
@@ -124,6 +128,61 @@ func (q *Queries) BeginSerializableTx(ctx context.Context) (*Queries, *sql.Tx, e
 		return &Queries{db: tx}, tx, nil
 	}
 	return nil, nil, errors.New("failed to convert DBTX to type sql.DB")
+}
+
+// WithWorkflowLifecycleLock serializes lifecycle side effects for one workflow across service instances.
+// The session lock uses a dedicated connection so callers can keep their database mutations in short transactions.
+func (q *Queries) WithWorkflowLifecycleLock(
+	ctx context.Context,
+	workflowID string,
+	operation func() error,
+) (err error) {
+	sqlDB, ok := q.db.(*sql.DB)
+	if !ok {
+		return errors.New("failed to convert DBTX to type sql.DB")
+	}
+	connection, err := sqlDB.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer connection.Close()
+
+	if _, err = connection.ExecContext(
+		ctx,
+		"SELECT pg_advisory_lock($1, hashtext($2))",
+		workflowLifecycleLockNamespace,
+		workflowID,
+	); err != nil {
+		return err
+	}
+
+	defer func() {
+		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		var unlocked bool
+		unlockErr := connection.QueryRowContext(
+			unlockCtx,
+			"SELECT pg_advisory_unlock($1, hashtext($2))",
+			workflowLifecycleLockNamespace,
+			workflowID,
+		).Scan(&unlocked)
+		if unlockErr == nil && !unlocked {
+			unlockErr = errors.New("workflow lifecycle advisory lock was not held")
+		}
+		if unlockErr == nil {
+			return
+		}
+
+		// Never return a connection with a potentially held session lock to the pool.
+		_ = connection.Raw(func(any) error { return driver.ErrBadConn })
+		if err == nil {
+			err = fmt.Errorf("failed to release workflow lifecycle lock: %w", unlockErr)
+		} else {
+			err = fmt.Errorf("%w; failed to release workflow lifecycle lock: %v", err, unlockErr)
+		}
+	}()
+
+	return operation()
 }
 
 // Query multiple rows with the given query and args.

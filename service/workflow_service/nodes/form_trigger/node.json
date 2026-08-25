@@ -34,7 +34,7 @@
   "group": [
     "trigger"
   ],
-  "iconUrl": "icons/n8n-nodes-base/dist/nodes/Form/form.svg",
+  "iconUrl": "/icons/embed/n8n-nodes-base.formTrigger/form.svg",
   "inputs": [],
   "name": "n8n-nodes-base.formTrigger",
   "outputs": [
@@ -105,6 +105,10 @@
                 {
                   "name": "Dropdown List",
                   "value": "dropdown"
+                },
+                {
+                  "name": "Email",
+                  "value": "email"
                 },
                 {
                   "name": "Number",

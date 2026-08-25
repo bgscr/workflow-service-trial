@@ -5,7 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
+	"mime"
+	"net/http"
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/service/sns"
@@ -14,6 +15,10 @@ import (
 	"github.com/sugerio/workflow-service-trial/shared/structs"
 	"github.com/valyala/fasthttp"
 )
+
+type formRenderer interface {
+	RenderForm(node *structs.WorkflowNode, actionURL string) ([]byte, error)
+}
 
 func (service *WorkflowService) HandleWebhook(ctx *fiber.Ctx) error {
 	method := ctx.Method()
@@ -26,13 +31,8 @@ func (service *WorkflowService) HandleWebhook(ctx *fiber.Ctx) error {
 			ctx, errors.New("missing required parameter: webhookId"))
 	}
 
-	// Confirm the AWS SNS subscription
-	if strings.Contains(string(ctx.Body()), "SubscriptionConfirmation") {
-		event := structs.AwsSnsSubscriptionConfirmationEvent{}
-		if err := json.Unmarshal(ctx.Body(), &event); err != nil {
-			return HandleBadRequestErrorWithTrace(ctx, err)
-		}
-
+	// Confirm the AWS SNS subscription.
+	if event, ok := parseSnsSubscriptionConfirmation(ctx.Get(fiber.HeaderContentType), ctx.Body()); ok {
 		confirmInput := sns.ConfirmSubscriptionInput{
 			Token:    &event.Token,
 			TopicArn: &event.TopicArn,
@@ -45,14 +45,12 @@ func (service *WorkflowService) HandleWebhook(ctx *fiber.Ctx) error {
 	}
 
 	// Load webhook entity
-	webhookEntity, err := core.GetWebhookEntity(ctx.UserContext(), workflowId, webhookId, isTest)
+	_, err := core.GetWebhookEntity(ctx.UserContext(), workflowId, webhookId, isTest, method)
 	if err != nil {
+		if errors.Is(err, core.ErrWebhookMethodNotAllowed) {
+			return HandleBadRequestErrorWithTrace(ctx, err)
+		}
 		return HandleNotFoundErrorWithTrace(ctx, err)
-	}
-	// Verify the http method matches
-	if webhookEntity.Method != method {
-		return HandleBadRequestErrorWithTrace(
-			ctx, errors.New("the http method is not allowed for this webhook"))
 	}
 
 	// Load workflow entity
@@ -69,6 +67,18 @@ func (service *WorkflowService) HandleWebhook(ctx *fiber.Ctx) error {
 	if webhookNode.WebhookId != webhookId {
 		return HandleBadRequestErrorWithTrace(
 			ctx, errors.New("the webhookId is not associated with the nodeId"))
+	}
+
+	if method == http.MethodGet {
+		nodeObject := core.GetAllNodeObjects()[webhookNode.Type]
+		if renderer, ok := nodeObject.(formRenderer); ok {
+			page, err := renderer.RenderForm(webhookNode, ctx.OriginalURL())
+			if err != nil {
+				return HandleInternalServerErrorWithTrace(ctx, err)
+			}
+			ctx.Set(fiber.HeaderContentType, "text/html; charset=utf-8")
+			return ctx.Status(fiber.StatusOK).Send(page)
+		}
 	}
 
 	// Parse webhook node options
@@ -222,6 +232,21 @@ func (service *WorkflowService) HandleWebhook(ctx *fiber.Ctx) error {
 		err := fmt.Errorf("workflowId=%s, unknown responseMode: %s", workflowId, responseMode)
 		return HandleInternalServerErrorWithTrace(ctx, err)
 	}
+}
+
+func parseSnsSubscriptionConfirmation(
+	contentType string,
+	body []byte,
+) (*structs.AwsSnsSubscriptionConfirmationEvent, bool) {
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil || (mediaType != "application/json" && mediaType != "text/plain") {
+		return nil, false
+	}
+	event := &structs.AwsSnsSubscriptionConfirmationEvent{}
+	if err := json.Unmarshal(body, event); err != nil || event.Type != "SubscriptionConfirmation" {
+		return nil, false
+	}
+	return event, true
 }
 
 // https://github.com/sugerio/workflow-service/blob/c1b5d949658247b19abfdb598cf4b427089cb099/packages/cli/src/WebhookHelpers.ts#L668

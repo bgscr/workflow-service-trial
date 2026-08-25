@@ -1,10 +1,11 @@
 package api_test
 
 // Command to run all tests under this package
-// go test -v service/workflow_service/api/*_test.go
+// go test -v ./service/workflow_service/api
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -42,6 +43,7 @@ var (
 	awsSdkClients      *awsLib.AwsSdkClients
 	temporalClient     client.Client
 	testFiberLambda    *fiberAdapter.FiberLambda
+	testRdsDb          *sql.DB
 )
 
 // There can be only ONE TestMain for each package. It has only one function named Run(), which runs all the tests within the package.
@@ -65,7 +67,7 @@ func TestMain(m *testing.M) {
 	}
 	environment.Extras = envSet
 
-	testRdsDb, err := structs.CreateRdsDbClientForLocalTest(ctx)
+	testRdsDb, err = structs.CreateRdsDbClientForLocalTest(ctx)
 	shared.Check(logger, "Failed to create test container for Postgres DB", err)
 	rdsDbQueries = rdsDbLib.New(testRdsDb)
 

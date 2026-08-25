@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -121,55 +122,77 @@ func (service *WorkflowService) UpdateWorkflow(c *fiber.Ctx) error {
 		params.Nodes[i].SugerOrgId = orgId
 	}
 
-	workflowEntity, err := core.GetWorkflowEntity(c.UserContext(), orgId, workflowId)
-	if err != nil {
-		return HandleInternalServerErrorWithTrace(c, err)
-	}
-
 	// Just update active, handle the webhook register/unregister and return.
 	if onlyUpdateActive {
-		// Call hook "workflow.update" here
-		workflowEntityUpdated_RdsDbLib, err := service.rdsDbQueries.UpdateWorkflowEntityActive(
+		var workflowEntity *structs.WorkflowEntity
+		err := service.rdsDbQueries.WithWorkflowLifecycleLock(
 			c.UserContext(),
-			rdsDbLib.UpdateWorkflowEntityActiveParams{
-				SugerOrgId: orgId,
-				ID:         workflowId,
-				Active:     params.Active,
-			})
-		if err != nil {
-			return HandleInternalServerErrorWithTrace(c, err)
-		}
-		workflowEntityUpdated, err := structs.ToWorkflowEntity(workflowEntityUpdated_RdsDbLib)
-		if err != nil {
-			return HandleInternalServerErrorWithTrace(c, err)
-		}
+			workflowId,
+			func() error {
+				currentWorkflow, err := core.GetWorkflowEntity(c.UserContext(), orgId, workflowId)
+				if err != nil {
+					return err
+				}
+				webhooksMaterialized, err := core.WorkflowWebhooksAreMaterialized(
+					c.UserContext(), currentWorkflow, params.Active)
+				if err != nil {
+					return err
+				}
+				scheduleMaterialized, err := temporal.ScheduleTriggerIsMaterialized(
+					c.UserContext(), currentWorkflow, params.Active)
+				if err != nil {
+					return err
+				}
+				activeStateChanged := currentWorkflow.Active != params.Active
+				if !activeStateChanged && webhooksMaterialized && scheduleMaterialized {
+					workflowEntity = currentWorkflow
+					return nil
+				}
 
-		// Call hook "workflow.afterUpdate"
-		if params.Active {
-			// Set up temporal workflow for active schedule trigger.
-			err := temporal.SetupTemporalWorkflow_ScheduleTrigger(c.UserContext(), &workflowEntityUpdated)
-			if err != nil {
-				return HandleInternalServerErrorWithTrace(c, err)
-			}
-			// For webhook trigger, register the workflow runner.
-			err = core.RegisterWebhook(c.UserContext(), workflowId, false)
-			if err != nil {
-				return HandleInternalServerErrorWithTrace(c, err)
-			}
-		} else {
-			err := temporal.TerminateTemporalWorkflow_ScheduleTrigger(c.UserContext(), &workflowEntityUpdated)
-			if err != nil {
-				return HandleInternalServerErrorWithTrace(c, err)
-			}
+				workflowEntityForTemporal := *currentWorkflow
+				workflowEntityForTemporal.Active = params.Active
+				temporalLifecycleChanged := false
+				if !scheduleMaterialized {
+					if params.Active {
+						// Set up temporal workflow for active schedule trigger.
+						err = temporal.SetupTemporalWorkflow_ScheduleTrigger(
+							c.UserContext(), &workflowEntityForTemporal)
+					} else {
+						err = temporal.TerminateTemporalWorkflow_ScheduleTrigger(
+							c.UserContext(), &workflowEntityForTemporal)
+					}
+					if err != nil {
+						return err
+					}
+					temporalLifecycleChanged = true
+				}
 
-			// For webhook trigger, unregister the workflow runner.
-			err = core.UnregisterWebhook(c.UserContext(), workflowId, false)
-			if err != nil {
-				return HandleInternalServerErrorWithTrace(c, err)
-			}
-		}
+				if activeStateChanged || !webhooksMaterialized {
+					_, err = core.UpdateWorkflowActiveWithWebhooks(
+						c.UserContext(), currentWorkflow, params.Active)
+				}
+				if err != nil && temporalLifecycleChanged {
+					var compensationErr error
+					if params.Active {
+						compensationErr = temporal.TerminateTemporalWorkflow_ScheduleTrigger(
+							c.UserContext(), &workflowEntityForTemporal)
+					} else {
+						compensationErr = temporal.SetupTemporalWorkflow_ScheduleTrigger(
+							c.UserContext(), &workflowEntityForTemporal)
+					}
+					if compensationErr != nil {
+						err = fmt.Errorf("%w; temporal compensation failed: %v", err, compensationErr)
+					}
+					return err
+				}
+				if err != nil {
+					return err
+				}
 
-		workflowEntity, err = core.GetWorkflowEntity(c.UserContext(), orgId, workflowId)
+				workflowEntity, err = core.GetWorkflowEntity(c.UserContext(), orgId, workflowId)
+				return err
+			},
+		)
 		if err != nil {
 			return HandleInternalServerErrorWithTrace(c, err)
 		}
@@ -186,67 +209,86 @@ func (service *WorkflowService) UpdateWorkflow(c *fiber.Ctx) error {
 		}
 	}
 
-	// Call hook "workflow.update" here
-
-	/*
-	 If the workflow being updated is stored as `active`, remove it from
-	 active workflows in memory, and re-add it after the update.
-
-	 If a trigger in the workflow was updated, the new value
-	 will take effect only on removing and re-adding.
-	*/
-	if workflowEntity.Active {
-		err := temporal.TerminateTemporalWorkflow_ScheduleTrigger(c.UserContext(), workflowEntity)
-		if err != nil {
-			return HandleInternalServerErrorWithTrace(c, err)
-		}
-		err = core.UnregisterWebhook(c.UserContext(), workflowEntity.ID, false)
-		if err != nil {
-			return HandleInternalServerErrorWithTrace(c, err)
-		}
-	}
-	// TODO: Set workflowSettings
-
-	// Update workflow_entity
-	workflowEntityUpdated_RdsDbLib, err := service.rdsDbQueries.UpdateWorkflowEntity(
+	var workflowEntityUpdated *structs.WorkflowEntity
+	err := service.rdsDbQueries.WithWorkflowLifecycleLock(
 		c.UserContext(),
-		rdsDbLib.UpdateWorkflowEntityParams{
-			SugerOrgId:   workflowEntity.SugerOrgId,
-			ID:           workflowEntity.ID,
-			Name:         params.Name,
-			Active:       params.Active,
-			Nodes:        json.RawMessage(core.JsonStr(params.Nodes)),
-			Connections:  json.RawMessage(core.JsonStr(params.Connections)),
-			Settings:     pqtype.NullRawMessage{RawMessage: json.RawMessage(core.JsonStr(params.Settings)), Valid: true},
-			StaticData:   pqtype.NullRawMessage{RawMessage: json.RawMessage(core.JsonStr(params.StaticData)), Valid: true},
-			PinData:      pqtype.NullRawMessage{RawMessage: json.RawMessage(core.JsonStr(params.PinData)), Valid: true},
-			VersionId:    sql.NullString{String: params.VersionId, Valid: true},
-			TriggerCount: 0,
-		})
-	if err != nil {
-		return HandleBadRequestErrorWithTrace(c, err)
-	}
-	workflowEntityUpdated, err := structs.ToWorkflowEntity(workflowEntityUpdated_RdsDbLib)
+		workflowId,
+		func() error {
+			workflowEntity, err := core.GetWorkflowEntity(c.UserContext(), orgId, workflowId)
+			if err != nil {
+				return err
+			}
+
+			// Call hook "workflow.update" here
+			if workflowEntity.Active {
+				if err = temporal.TerminateTemporalWorkflow_ScheduleTrigger(
+					c.UserContext(), workflowEntity); err != nil {
+					return err
+				}
+			}
+			if params.Active {
+				if err = temporal.SetupTemporalWorkflow_ScheduleTrigger(
+					c.UserContext(), &params); err != nil {
+					return compensateTemporalWorkflowUpdate(
+						c.UserContext(), workflowEntity, &params, err)
+				}
+			}
+
+			// TODO: Set workflowSettings
+			workflowEntityUpdated, err = core.UpdateWorkflowWithWebhooks(
+				c.UserContext(),
+				workflowEntity,
+				rdsDbLib.UpdateWorkflowEntityParams{
+					SugerOrgId:   workflowEntity.SugerOrgId,
+					ID:           workflowEntity.ID,
+					Name:         params.Name,
+					Active:       params.Active,
+					Nodes:        json.RawMessage(core.JsonStr(params.Nodes)),
+					Connections:  json.RawMessage(core.JsonStr(params.Connections)),
+					Settings:     pqtype.NullRawMessage{RawMessage: json.RawMessage(core.JsonStr(params.Settings)), Valid: true},
+					StaticData:   pqtype.NullRawMessage{RawMessage: json.RawMessage(core.JsonStr(params.StaticData)), Valid: true},
+					PinData:      pqtype.NullRawMessage{RawMessage: json.RawMessage(core.JsonStr(params.PinData)), Valid: true},
+					VersionId:    sql.NullString{String: params.VersionId, Valid: true},
+					TriggerCount: 0,
+				})
+			if err != nil {
+				return compensateTemporalWorkflowUpdate(
+					c.UserContext(), workflowEntity, &params, err)
+			}
+
+			// TODO: Update tagMappingRepository
+			// TODO: Save version to workflowHistory
+			// Call hook "workflow.afterUpdate"
+			return nil
+		},
+	)
 	if err != nil {
 		return HandleInternalServerErrorWithTrace(c, err)
 	}
 
-	// TODO: Update tagMappingRepository
-	// TODO: Save version to workflowHistory
-	// Call hook "workflow.afterUpdate"
-	if workflowEntity.Active {
-		err := temporal.SetupTemporalWorkflow_ScheduleTrigger(c.UserContext(), workflowEntity)
-		if err != nil {
-			return HandleInternalServerErrorWithTrace(c, err)
-		}
-		err = core.RegisterWebhook(c.UserContext(), workflowEntity.ID, false)
-		if err != nil {
-			return HandleInternalServerErrorWithTrace(c, err)
+	response := structs.UpdateWorkflowResponse{Data: workflowEntityUpdated}
+	return c.Status(fiber.StatusOK).JSON(response)
+}
+
+func compensateTemporalWorkflowUpdate(
+	ctx context.Context,
+	previousWorkflow *structs.WorkflowEntity,
+	requestedWorkflow *structs.WorkflowEntity,
+	cause error,
+) error {
+	if requestedWorkflow.Active {
+		if compensationErr := temporal.TerminateTemporalWorkflow_ScheduleTrigger(
+			ctx, requestedWorkflow); compensationErr != nil {
+			cause = fmt.Errorf("%w; temporal compensation failed: %v", cause, compensationErr)
 		}
 	}
-
-	response := structs.UpdateWorkflowResponse{Data: &workflowEntityUpdated}
-	return c.Status(fiber.StatusOK).JSON(response)
+	if previousWorkflow.Active {
+		if compensationErr := temporal.SetupTemporalWorkflow_ScheduleTrigger(
+			ctx, previousWorkflow); compensationErr != nil {
+			cause = fmt.Errorf("%w; temporal compensation failed: %v", cause, compensationErr)
+		}
+	}
+	return cause
 }
 
 func (service *WorkflowService) ManualRunWorkflow(ctx *fiber.Ctx) error {
@@ -360,29 +402,30 @@ func (service *WorkflowService) DeleteWorkflow(ctx *fiber.Ctx) error {
 	if orgId == "" || workflowId == "" {
 		return HandleBadRequestErrorWithTrace(ctx, fmt.Errorf("orgId or workflowId is empty"))
 	}
-	workflowEntity, err := core.GetWorkflowEntity(ctx.UserContext(), orgId, workflowId)
-	if err != nil {
-		return HandleInternalServerErrorWithTrace(ctx, err)
-	}
+	var workflowDB *structs.WorkflowEntity
+	err := service.rdsDbQueries.WithWorkflowLifecycleLock(
+		ctx.UserContext(),
+		workflowId,
+		func() error {
+			workflowEntity, err := core.GetWorkflowEntity(ctx.UserContext(), orgId, workflowId)
+			if err != nil {
+				return err
+			}
 
-	// Terminate the temporal workflow for the schedule trigger if any.
-	err = temporal.TerminateTemporalWorkflow_ScheduleTrigger(ctx.UserContext(), workflowEntity)
-	if err != nil {
-		return HandleInternalServerErrorWithTrace(ctx, err)
-	}
-	// Unregister the webhook for webhook/trigger if any.
-	err = core.UnregisterWebhook(ctx.UserContext(), workflowId, false)
-	if err != nil {
-		return HandleInternalServerErrorWithTrace(ctx, err)
-	}
-	// Unregister the test webhook if any.
-	err = core.UnregisterWebhook(ctx.UserContext(), workflowId, true)
-	if err != nil {
-		return HandleInternalServerErrorWithTrace(ctx, err)
-	}
+			if workflowEntity.Active {
+				err = temporal.TerminateTemporalWorkflow_ScheduleTrigger(ctx.UserContext(), workflowEntity)
+				if err != nil {
+					return err
+				}
+			}
 
-	// Delete workflow entity
-	workflowDB, err := core.DeleteWorkflowEntity(ctx.UserContext(), orgId, workflowId)
+			workflowDB, err = core.DeleteWorkflowWithWebhooks(ctx.UserContext(), workflowEntity)
+			if err != nil {
+				return compensateWorkflowDeletion(ctx.UserContext(), workflowEntity, err)
+			}
+			return nil
+		},
+	)
 	if err != nil {
 		return HandleInternalServerErrorWithTrace(ctx, err)
 	}
@@ -390,6 +433,20 @@ func (service *WorkflowService) DeleteWorkflow(ctx *fiber.Ctx) error {
 		Data: workflowDB != nil,
 	}
 	return ctx.Status(fiber.StatusOK).JSON(response)
+}
+
+func compensateWorkflowDeletion(
+	ctx context.Context,
+	workflowEntity *structs.WorkflowEntity,
+	cause error,
+) error {
+	if !workflowEntity.Active {
+		return cause
+	}
+	if compensationErr := temporal.SetupTemporalWorkflow_ScheduleTrigger(ctx, workflowEntity); compensationErr != nil {
+		return fmt.Errorf("%w; temporal compensation failed: %v", cause, compensationErr)
+	}
+	return cause
 }
 
 func (service *WorkflowService) DeleteTestWebhook(ctx *fiber.Ctx) error {

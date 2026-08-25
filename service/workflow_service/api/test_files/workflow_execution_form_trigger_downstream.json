@@ -1,0 +1,56 @@
+{
+  "name": "Form Trigger with downstream node",
+  "active": false,
+  "connections": {
+    "Form Trigger": {
+      "main": [
+        [
+          {
+            "node": "Code",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "nodes": [
+    {
+      "id": "form-trigger-node",
+      "name": "Form Trigger",
+      "typeVersion": 2,
+      "type": "n8n-nodes-base.formTrigger",
+      "position": [420, 200],
+      "parameters": {
+        "path": "contact",
+        "formTitle": "Contact us",
+        "formDescription": "We will get back to you soon.",
+        "formFields": {
+          "values": [
+            { "fieldLabel": "Name" },
+            { "fieldLabel": "Department", "fieldType": "dropdown" }
+          ]
+        },
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "webhookId": "form-trigger-downstream-webhook"
+    },
+    {
+      "id": "code-node",
+      "name": "Code",
+      "typeVersion": 2,
+      "type": "n8n-nodes-base.code",
+      "position": [640, 200],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "return [{ json: { propagatedName: $input.first().json.Name, propagatedDepartment: $input.first().json.Department, propagatedMode: $input.first().json.formMode } }];"
+      }
+    }
+  ],
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

@@ -8,8 +8,10 @@ import (
 
 	"github.com/sugerio/workflow-service-trial/shared/structs"
 
+	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
+	"golang.org/x/exp/slices"
 
 	"github.com/sugerio/workflow-service-trial/service/workflow_service/core"
 	"github.com/sugerio/workflow-service-trial/service/workflow_service/nodes/schedule_trigger"
@@ -115,57 +117,80 @@ func SetupTemporalWorkflow_ScheduleTrigger(ctx context.Context, workflowEntity *
 		return errors.New("workflowEntity is nil or missing required fields")
 	}
 
-	// find all schedule triggers from structs.
+	scheduleSpec := getScheduleTriggerSpec(ctx, workflowEntity)
+	if scheduleSpec == "" {
+		return nil
+	}
+
+	ctx = context.WithValue(
+		ctx,
+		sharedTemporal.CommonPropagateContextKey,
+		sharedTemporal.CommonCtxPropagation{Environment: core.GetEnvironment()})
+	temporalWorkflowOptions := GetTemporalWorkflowOptions_ScheduleTrigger(
+		workflowEntity.SugerOrgId, workflowEntity.ID, scheduleSpec)
+	_, err := sharedTemporal.StartWorkflow_Override(
+		ctx,
+		core.GetTemporalClient(),
+		&temporalWorkflowOptions,
+		Workflow_ScheduleTrigger,
+		workflowEntity.SugerOrgId,
+		workflowEntity.ID)
+	return err
+}
+
+// ScheduleTriggerIsMaterialized reports whether the expected Temporal schedule
+// is in the desired active state. Workflows without a valid enabled schedule need no resource.
+func ScheduleTriggerIsMaterialized(
+	ctx context.Context,
+	workflowEntity *structs.WorkflowEntity,
+	active bool,
+) (bool, error) {
+	if workflowEntity == nil || workflowEntity.SugerOrgId == "" || workflowEntity.ID == "" {
+		return false, errors.New("workflowEntity is nil or missing required fields")
+	}
+	if getScheduleTriggerSpec(ctx, workflowEntity) == "" {
+		return true, nil
+	}
+
+	description, err := core.GetTemporalClient().DescribeWorkflowExecution(
+		ctx,
+		GetTemporalWorkflowId_ScheduleTrigger(workflowEntity.SugerOrgId, workflowEntity.ID),
+		"",
+	)
+	if err != nil {
+		if _, ok := err.(*serviceerror.NotFound); ok {
+			return !active, nil
+		}
+		return false, err
+	}
+	if description.WorkflowExecutionInfo == nil {
+		return false, fmt.Errorf("failed to get schedule workflow execution info for workflow %s", workflowEntity.ID)
+	}
+
+	status := description.WorkflowExecutionInfo.Status
+	if active {
+		return slices.Contains(sharedTemporal.WorkflowOpeningStatus, status), nil
+	}
+	return slices.Contains(sharedTemporal.WorkflowClosedStatus, status), nil
+}
+
+func getScheduleTriggerSpec(ctx context.Context, workflowEntity *structs.WorkflowEntity) string {
 	for index := range workflowEntity.Nodes {
 		node := workflowEntity.Nodes[index]
-		if node.Disabled {
+		if node.Disabled || node.Type != schedule_trigger.Name {
 			continue
 		}
 
-		if node.Type != schedule_trigger.Name {
-			// Skip if the node is not a schedule trigger.
-			continue
-		}
-
-		// create trigger
 		nodeObj := core.MustNewNode(node.Type)
 		triggerObj, ok := nodeObj.(core.TriggerObject)
 		if !ok {
 			continue
 		}
-
-		ctx := context.WithValue(
-			ctx,
-			sharedTemporal.CommonPropagateContextKey,
-			sharedTemporal.CommonCtxPropagation{Environment: core.GetEnvironment()})
-
-		scheduleSpec := triggerObj.Trigger(ctx, &node)
-		if scheduleSpec == "" {
-			// Skip if the schedule spec is empty.
-			continue
+		if scheduleSpec := triggerObj.Trigger(ctx, &node); scheduleSpec != "" {
+			return scheduleSpec
 		}
-
-		// Only start the temporal workflow for the first schedule.
-		// We don't support multiple cron schedules for the same structs.
-		temporalWorkflowOptions := GetTemporalWorkflowOptions_ScheduleTrigger(
-			workflowEntity.SugerOrgId, workflowEntity.ID, scheduleSpec)
-		_, err := sharedTemporal.StartWorkflow_Override(
-			ctx,
-			core.GetTemporalClient(),
-			&temporalWorkflowOptions,
-			Workflow_ScheduleTrigger,
-			workflowEntity.SugerOrgId,
-			workflowEntity.ID)
-		if err != nil {
-			return err
-		}
-
-		// Only start the temporal workflow for the first found schedule trigger node.
-		// We don't support multiple schedule trigger nodes for the same structs.
-		break
 	}
-
-	return nil
+	return ""
 }
 
 // Terminate one temporal workflow for schedule trigger by given the workflow entity.

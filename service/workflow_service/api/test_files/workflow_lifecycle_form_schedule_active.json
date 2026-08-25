@@ -1,0 +1,50 @@
+{
+  "name": "Pre-active Lifecycle Form and Schedule",
+  "active": true,
+  "connections": {},
+  "nodes": [
+    {
+      "id": "form-trigger-node",
+      "name": "Form Trigger",
+      "typeVersion": 2,
+      "type": "n8n-nodes-base.formTrigger",
+      "position": [420, 200],
+      "parameters": {
+        "path": "contact",
+        "formTitle": "Contact us",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Name",
+              "requiredField": true
+            }
+          ]
+        },
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "webhookId": "pre-active-lifecycle-form-webhook"
+    },
+    {
+      "id": "schedule-trigger-node",
+      "name": "Schedule Trigger",
+      "typeVersion": 1.1,
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "position": [420, 400],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 24
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
